@@ -1,4 +1,15 @@
 #include "main.h"
+#include "cy_pdl.h"
+#include "cyhal.h"
+#include "cybsp.h"
+#include "cy_retarget_io.h"
+
+/* Model data */
+extern const unsigned char model_tflite[];
+extern const int model_tflite_len;
+
+/* TFLM context */
+static tflm_context_t tflm_context;
 
 /* TensorFlow Lite for Microcontrollers */
 namespace {
@@ -18,116 +29,111 @@ const char* gesture_labels[] = {
 };
 
 /* Function to initialize hardware */
-void initialize_hardware(void) {
-    /* Initialize system */
+cy_rslt_t initialize_hardware(void) {
     cy_rslt_t result;
-    
+
     /* Initialize the device and board peripherals */
     result = cybsp_init();
-    CY_ASSERT(result == CY_RSLT_SUCCESS);
-    
-    /* Enable global interrupts */
-    __enable_irq();
-    
-    /* Initialize retarget-io for UART output */
+    if (result != CY_RSLT_SUCCESS) {
+        return result;
+    }
+
+    /* Initialize retarget-io to use the debug UART port */
     cy_retarget_io_init(CYBSP_DEBUG_UART_TX, CYBSP_DEBUG_UART_RX, CY_RETARGET_IO_BAUDRATE);
-    
-    /* Initialize camera interface */
-    setup_camera();
+
+    /* Initialize the camera */
+    // TODO: Add camera initialization code
+
+    return CY_RSLT_SUCCESS;
 }
 
 /* Function to setup TensorFlow Lite Micro */
-bool setup_tensorflow(void) {
-    /* Set up logging */
-    static tflite::MicroErrorReporter micro_error_reporter;
-    error_reporter = &micro_error_reporter;
-    
-    /* Map the model into a usable data structure */
-    model = tflite::GetModel(model_tflite);
-    if (model->version() != TFLITE_SCHEMA_VERSION) {
-        TF_LITE_REPORT_ERROR(error_reporter,
-            "Model provided is schema version %d not equal "
-            "to supported version %d.",
-            model->version(), TFLITE_SCHEMA_VERSION);
-        return false;
-    }
-    
-    /* Pull in only the operation implementations we need */
-    static tflite::AllOpsResolver resolver;
-    
-    /* Build an interpreter to run the model with */
-    static tflite::MicroInterpreter static_interpreter(
-        model, resolver, tensor_arena, TENSOR_ARENA_SIZE, error_reporter);
-    interpreter = &static_interpreter;
-    
-    /* Allocate memory from the tensor_arena for the model's tensors */
-    TfLiteStatus allocate_status = interpreter->AllocateTensors();
-    if (allocate_status != kTfLiteOk) {
-        TF_LITE_REPORT_ERROR(error_reporter, "AllocateTensors() failed");
-        return false;
-    }
-    
-    /* Get pointers to the model's input and output tensors */
-    input = interpreter->input(0);
-    output = interpreter->output(0);
-    
-    return true;
+cy_rslt_t initialize_tflm(void) {
+    /* Initialize TFLM */
+    return tflm_init(&tflm_context, model_tflite);
 }
 
 /* Function to process gesture */
-void process_gesture(uint8_t* image_data) {
+cy_rslt_t process_gesture(const uint8_t* image_data) {
+    cy_rslt_t result;
+    TfLiteTensor* input_tensor;
+    TfLiteTensor* output_tensor;
+    float max_value = 0.0f;
+    int max_index = -1;
+
+    /* Get input tensor */
+    input_tensor = tflm_get_input_tensor(&tflm_context, 0);
+    if (input_tensor == NULL) {
+        return CY_RSLT_TYPE_ERROR;
+    }
+
     /* Copy image data to input tensor */
-    for (int i = 0; i < IMAGE_SIZE * IMAGE_SIZE; i++) {
-        input->data.int8[i] = (int8_t)(image_data[i] - 128);  // Convert to signed int8
-    }
-    
+    memcpy(input_tensor->data.data, image_data, IMAGE_WIDTH * IMAGE_HEIGHT * IMAGE_CHANNELS);
+
     /* Run inference */
-    TfLiteStatus invoke_status = interpreter->Invoke();
-    if (invoke_status != kTfLiteOk) {
-        printf("Invoke failed\n");
-        return;
+    result = tflm_invoke(&tflm_context);
+    if (result != CY_RSLT_SUCCESS) {
+        return result;
     }
-    
-    /* Find the index with highest probability */
-    int8_t max_score = output->data.int8[0];
-    int max_index = 0;
-    for (int i = 1; i < NUM_CLASSES; i++) {
-        if (output->data.int8[i] > max_score) {
-            max_score = output->data.int8[i];
+
+    /* Get output tensor */
+    output_tensor = tflm_get_output_tensor(&tflm_context, 0);
+    if (output_tensor == NULL) {
+        return CY_RSLT_TYPE_ERROR;
+    }
+
+    /* Find the gesture with highest confidence */
+    for (int i = 0; i < NUM_GESTURES; i++) {
+        float value = output_tensor->data.f[i];
+        if (value > max_value) {
+            max_value = value;
             max_index = i;
         }
     }
-    
-    /* Print the result */
-    printf("Detected gesture: %s (confidence: %d)\n", 
-           gesture_labels[max_index], max_score);
+
+    /* Print result */
+    print_gesture_result(max_index, max_value);
+
+    return CY_RSLT_SUCCESS;
+}
+
+void print_gesture_result(int gesture_index, float confidence) {
+    printf("Detected gesture: %s with confidence: %.2f%%\r\n", 
+           gesture_labels[gesture_index], confidence * 100.0f);
 }
 
 /* Main function */
 int main(void) {
+    cy_rslt_t result;
+    uint8_t image_buffer[IMAGE_WIDTH * IMAGE_HEIGHT * IMAGE_CHANNELS];
+
     /* Initialize hardware */
-    initialize_hardware();
-    printf("Hardware initialized\n");
-    
-    /* Setup TensorFlow Lite Micro */
-    if (!setup_tensorflow()) {
-        printf("TensorFlow setup failed\n");
-        return -1;
+    result = initialize_hardware();
+    if (result != CY_RSLT_SUCCESS) {
+        CY_ASSERT(0);
     }
-    printf("TensorFlow initialized\n");
-    
-    /* Buffer for image data */
-    uint8_t image_buffer[IMAGE_SIZE * IMAGE_SIZE];
-    
+
+    /* Initialize TFLM */
+    result = initialize_tflm();
+    if (result != CY_RSLT_SUCCESS) {
+        CY_ASSERT(0);
+    }
+
+    printf("Gesture recognition system initialized\r\n");
+
     /* Main loop */
     for (;;) {
         /* Capture image */
-        capture_image(image_buffer);
-        
-        /* Process the gesture */
-        process_gesture(image_buffer);
-        
-        /* Wait before next capture */
-        cyhal_system_delay_ms(1000);
+        // TODO: Add camera capture code
+        // capture_image(image_buffer);
+
+        /* Process gesture */
+        result = process_gesture(image_buffer);
+        if (result != CY_RSLT_SUCCESS) {
+            printf("Error processing gesture\r\n");
+        }
+
+        /* Wait for next frame */
+        cyhal_system_delay_ms(100);
     }
 } 
